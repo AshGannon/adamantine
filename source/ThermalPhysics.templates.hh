@@ -11,6 +11,7 @@
 #include <CubeHeatSource.hh>
 #include <ElectronBeamHeatSource.hh>
 #include <GoldakHeatSource.hh>
+#include <DonutHeatSource.hh>
 #include <ThermalOperator.hh>
 #include <ThermalOperatorDevice.hh>
 #include <ThermalPhysics.hh>
@@ -316,6 +317,10 @@ ThermalPhysics<dim, p_order, fe_degree, MaterialStates, MemorySpaceType,
     {
       _heat_sources[i] = std::make_shared<CubeHeatSource<dim>>(
           beam_database, units_optional_database);
+    }
+    else if (type == "friction_stir_weld")
+    {
+      _heat_sources[i] = std::make_shared<DonutHeatSource<dim>>(beam_database);
     }
     else
     {

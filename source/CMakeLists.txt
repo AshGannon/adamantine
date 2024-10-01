@@ -3,6 +3,7 @@ set(Adamantine_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/BodyForce.hh
     ${CMAKE_CURRENT_SOURCE_DIR}/CubeHeatSource.hh
     ${CMAKE_CURRENT_SOURCE_DIR}/DataAssimilator.hh
+    ${CMAKE_CURRENT_SOURCE_DIR}/DonutHeatSource.hh
     ${CMAKE_CURRENT_SOURCE_DIR}/ElectronBeamHeatSource.hh
     ${CMAKE_CURRENT_SOURCE_DIR}/ExperimentalData.hh
     ${CMAKE_CURRENT_SOURCE_DIR}/Geometry.hh
@@ -40,6 +41,7 @@ set(Adamantine_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/BodyForce.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/CubeHeatSource.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/DataAssimilator.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/DonutHeatSource.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/ElectronBeamHeatSource.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/Geometry.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/GoldakHeatSource.cc

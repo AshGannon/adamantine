@@ -8,56 +8,34 @@
 #include <DonutHeatSource.hh>
 #include <instantiation.hh>
 #include <types.hh>
-#include <cmath> // For log and exp in Johnson-Cook model
+#include <cmath> // For mathematical functions
 
 namespace adamantine
 {
 
 // Constructor: Initializes the donut-shaped heat source for AFSD (Ti64)
-// Retrieves the necessary parameters such as inner radius, rotation speed, strain rate, strain, and heat modifiers.
 template <int dim>
 DonutHeatSource<dim>::DonutHeatSource(boost::property_tree::ptree const &database)
     : HeatSource<dim>(database),
       _current_angle(0.0)
 {
-  // Retrieve the inner radius for the donut shape from the input file
+  // Retrieve the inner radius and diameter of the donut shape from the input file
   double inner_radius = database.get<double>("inner_radius");
   _inner_radius_squared = std::pow(inner_radius, 2);
-
-  // Retrieve rotational parameters for AFSD, like spindle speed and heat modifiers
+  _diameter = database.get<double>("diameter");
+  // Retrieve rotational parameters for AFSD
   _rotation_speed = database.get<double>("rotation_speed", 0.0); // Default to 0 if not provided
   _advancing_heat_modifier = database.get<double>("advancing_heat_modifier", 1.0);
   _retreating_heat_modifier = database.get<double>("retreating_heat_modifier", 1.0);
-
-  // Retrieve parameters for the Johnson-Cook model:
-  //Loading defaults for Ti-6Al-4V (Ti64) from Daridon, Oussouaddi, Ahzi 2004
-  _yield_stress = database.get<double>("_yield_stress", 897.0);          // MPa
-  _hardening_constant = database.get<double>("_hardening_constant", 850.0); // MPa
-  hardening_exponent = database.get<double>("hardening_exponent", 0.28);
-  strain_rate_sensitivity = database.get<double>("strain_rate_sensitivity", 0.014);
-  thermal_softening_exponent = database.get<double>("thermal_softening_exponent", 1.1);
-  reference_strain_rate = database.get<double>("reference_strain_rate", 1.0); // s^-1
-  melting_temperature = database.get<double>("melting_temperature", 1878.0); // K
-  reference_temperature = database.get<double>("reference_temperature", 298.0); // K
-  friction_coefficient = database.get<double>("friction_coefficient", 0.5); // Default to 0.5 for Ti64
-
-  // Retrieve strain and strain rate from the database
-  strain = database.get<double>("strain", 0.1); // Default value 0.1
-  strain_rate = database.get<double>("strain_rate", 5.0); // Default value 5.0 s^-1
+  // Retrieve the material thickness from the input file
+  _material_thickness = database.get<double>("depth");
+  // Define a constant factor k for the heat input calculation
+  _efficiency = database.get<double>("absorption_efficiency", 0.8); // Default to 0.8, adjust based on calibration
+  _force = database.get<double>("force", 4900.0); // Default to 1.0, adjust based on calibration
+  _sigma = database.get<double>("heat_distribution_sigma", _diameter*4.0); // Control heat spread
 }
 
-// Function to compute the Johnson-Cook flow stress for Ti-6Al-4V
-template <int dim>
-double DonutHeatSource<dim>::compute_flow_stress(double temperature) const
-{
-  // Johnson-Cook model for flow stress (in MPa)
-  double temp_factor = (1.0 - std::pow((temperature - reference_temperature) / (melting_temperature - reference_temperature), thermal_softening_exponent));
-  double strain_rate_factor = (1.0 + strain_rate_sensitivity * std::log(strain_rate / reference_strain_rate));
-  double flow_stress = (_yield_stress + _hardening_constant * std::pow(strain, hardening_exponent)) * strain_rate_factor * temp_factor;
-  return flow_stress;
-}
-
-// Update the current time step and calculate heat input based on AFSD-specific factors (Ti64)
+// Update the current time step and calculate heat input based on simplified factors
 template <int dim>
 void DonutHeatSource<dim>::update_time(double time)
 {
@@ -67,30 +45,24 @@ void DonutHeatSource<dim>::update_time(double time)
   // Calculate the current angle based on rotation speed and time for rotating tool behavior
   _current_angle = std::fmod(_rotation_speed * time, 2.0 * dealii::numbers::PI);
 
-  // Assume an example temperature for calculation (this could be dynamic)
-  double temperature = 900.0; // Example temperature in Kelvin
+  // Calculate tool radius (half the diameter)
+  double tool_radius = _diameter / 2.0;
 
-  // Compute flow stress using Johnson-Cook model for Ti64 with the strain and strain rate loaded from the database
-  double flow_stress = compute_flow_stress(temperature);
+  // Calculate angular velocity (in rad/s)
+  double angular_velocity = _rotation_speed * 2.0 * dealii::numbers::PI / 60.0; // Convert RPM to rad/s
 
-  // Compute frictional power and adiabatic heating for AFSD (Ti64)
-  double friction_radius = 0.01; // Example tool radius in meters
-  double contact_area = M_PI * friction_radius * friction_radius; // Contact area of the tool
-  double layer_thickness = 0.005;  // Example thickness of the material in meters
+  // Calculate torque (Force * Radius)
+  double torque = _force * tool_radius;
 
-         // Friction power: heat generated by the friction at the tool-material interface
-  double friction_power = friction_coefficient * flow_stress * contact_area * friction_radius * _rotation_speed;
+  // Calculate power (Torque * Angular Velocity)
+  double power = torque * angular_velocity;
 
-         // Adiabatic heating: heat generated due to plastic deformation, scaled by the Taylor-Quinney coefficient (e.g., 0.9)
-  double adiabatic_power = 0.9 * flow_stress * strain_rate * contact_area * layer_thickness;
-
-         // Simplified heat input term based on friction and adiabatic heating
-  _alpha = (friction_power + adiabatic_power) / (contact_area * layer_thickness);
-  //std::cout << "Heat input: " << _alpha << std::endl;
+  // Calculate heat input based on power and efficiency
+  _alpha = _efficiency * power;
+  std::cout << "Heat input value: " << _alpha << std::endl;
 }
 
 // This method calculates the heat source value at a given point in space and time.
-// The result depends on the point's location relative to the tool, and whether it's on the advancing or retreating side.
 template <int dim>
 double DonutHeatSource<dim>::value(dealii::Point<dim> const &point, double const height) const
 {
@@ -122,15 +94,15 @@ double DonutHeatSource<dim>::value(dealii::Point<dim> const &point, double const
     double relative_angle = std::fmod(point_angle - _current_angle, 2.0 * dealii::numbers::PI);
 
     // Determine if the point is on the advancing side or retreating side
-    // The advancing side is typically within +/- PI/2 of the tool's rotation direction
     double heat_modifier = (relative_angle >= -dealii::numbers::PI / 2.0 && relative_angle <= dealii::numbers::PI / 2.0)
                                ? _advancing_heat_modifier
                                : _retreating_heat_modifier;
-
-
-    // Return the heat source value based on the friction and adiabatic heating, modified by the position in the x-y plane
-    double heat_source = _alpha * heat_modifier * (xpy_squared - _inner_radius_squared);
-    std::cout << "Heat source: " << heat_source << std::endl;
+    std::cout << "r " << xpy_squared << std::endl;
+    std::cout << "denom " << 2.0 * std::pow(_sigma, 2) << std::endl;
+    std::cout << "exp " << std::exp(-xpy_squared / (2.0 * std::pow(_sigma, 2))) << std::endl;
+    // Apply a Gaussian radial decay for FSW heat distribution
+    double heat_source =1000* _alpha * heat_modifier * std::exp(-xpy_squared / (2.0 * std::pow(_sigma, 2)));
+    std::cout << "Heat source value: " << heat_source << std::endl;
     return heat_source;
   }
 }

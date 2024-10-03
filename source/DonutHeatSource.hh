@@ -54,23 +54,17 @@ private:
   double _alpha = std::numeric_limits<double>::signaling_NaN();
   double const _pi_over_3_to_1p5 = std::pow(dealii::numbers::PI / 3.0, 1.5);
   double _inner_radius_squared;
+  double _diameter;
   // Member variables for rotational dynamics of the heat source
   double _rotation_speed; // Angular velocity (radians per second)
   double _current_angle;  // Current angle based on time
   //account for the asymmetry in heat generation between the advancing and retreating sides of the tool.
   double _advancing_heat_modifier;
   double _retreating_heat_modifier;
-  double _yield_stress;
-  double _hardening_constant;
-  double hardening_exponent;
-  double strain_rate_sensitivity;
-  double thermal_softening_exponent;
-  double reference_strain_rate;
-  double melting_temperature;
-  double reference_temperature;
-  double friction_coefficient;
-  double strain;
-  double strain_rate;
+  double _material_thickness;
+  double _efficiency; // Constant factor for heat input calculation
+  double _force;
+  double _sigma;
 };
 } // namespace adamantine
 

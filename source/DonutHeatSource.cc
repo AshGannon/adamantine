@@ -27,12 +27,9 @@ DonutHeatSource<dim>::DonutHeatSource(boost::property_tree::ptree const &databas
   _rotation_speed = database.get<double>("rotation_speed", 0.0); // Default to 0 if not provided
   _advancing_heat_modifier = database.get<double>("advancing_heat_modifier", 1.0);
   _retreating_heat_modifier = database.get<double>("retreating_heat_modifier", 1.0);
-  // Retrieve the material thickness from the input file
-  _material_thickness = database.get<double>("depth");
   // Define a constant factor k for the heat input calculation
   _efficiency = database.get<double>("absorption_efficiency", 0.8); // Default to 0.8, adjust based on calibration
-  _force = database.get<double>("force", 4900.0); // Default to 1.0, adjust based on calibration
-  _sigma = database.get<double>("heat_distribution_sigma", _diameter*4.0); // Control heat spread
+  _force = database.get<double>("force", 4900.0); // Default to 4900.0, adjust based on calibration
 }
 
 // Update the current time step and calculate heat input based on simplified factors
@@ -58,7 +55,7 @@ void DonutHeatSource<dim>::update_time(double time)
   double power = torque * angular_velocity;
 
   // Calculate heat input based on power and efficiency
-  _alpha = _efficiency * power;
+  _alpha = _efficiency * power * _log_01/(dealii::numbers::PI * std::pow(tool_radius, 2) * this->_beam.depth);
   std::cout << "Heat input value: " << _alpha << std::endl;
 }
 
@@ -76,6 +73,9 @@ double DonutHeatSource<dim>::value(dealii::Point<dim> const &point, double const
   }
   else
   {
+    //set up z distribution
+    double const distribution_z = -3. * std::pow(z / this->_beam.depth, 2) -
+                                  2. * (z / this->_beam.depth) + 1.;
     // Calculate the radial distance from the beam center in the x-y plane
     double xpy_squared = std::pow(point[axis<dim>::x] - _beam_center[axis<dim>::x], 2);
     if (dim == 3)
@@ -86,7 +86,7 @@ double DonutHeatSource<dim>::value(dealii::Point<dim> const &point, double const
     // Exclude points within the inner radius of the donut-shaped heat source (center of tool)
     if (xpy_squared < _inner_radius_squared)
     {
-      return 0.;
+      return 300.;
     }
 
     // Calculate the angle of the point relative to the current rotation angle of the tool
@@ -97,12 +97,10 @@ double DonutHeatSource<dim>::value(dealii::Point<dim> const &point, double const
     double heat_modifier = (relative_angle >= -dealii::numbers::PI / 2.0 && relative_angle <= dealii::numbers::PI / 2.0)
                                ? _advancing_heat_modifier
                                : _retreating_heat_modifier;
-    std::cout << "r " << xpy_squared << std::endl;
-    std::cout << "denom " << 2.0 * std::pow(_sigma, 2) << std::endl;
-    std::cout << "exp " << std::exp(-xpy_squared / (2.0 * std::pow(_sigma, 2))) << std::endl;
     // Apply a Gaussian radial decay for FSW heat distribution
-    double heat_source =1000* _alpha * heat_modifier * std::exp(-xpy_squared / (2.0 * std::pow(_sigma, 2)));
-    std::cout << "Heat source value: " << heat_source << std::endl;
+    double heat_source =
+        _alpha * heat_modifier * std::exp(_log_01 * xpy_squared / std::pow(_diameter / 2.0, 2))*
+        distribution_z;
     return heat_source;
   }
 }

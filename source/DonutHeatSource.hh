@@ -61,10 +61,10 @@ private:
   //account for the asymmetry in heat generation between the advancing and retreating sides of the tool.
   double _advancing_heat_modifier;
   double _retreating_heat_modifier;
-  double _material_thickness;
   double _efficiency; // Constant factor for heat input calculation
   double _force;
   double _sigma;
+  double const _log_01 = std::log(0.1);
 };
 } // namespace adamantine
 

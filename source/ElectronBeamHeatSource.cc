@@ -58,7 +58,7 @@ double ElectronBeamHeatSource<dim>::value(dealii::Point<dim> const &point,
     double heat_source =
         _alpha * std::exp(_log_01 * xpy_squared / this->_beam.radius_squared) *
         distribution_z;
-
+    std::cout << "Heat source value: " << heat_source << std::endl;
     return heat_source;
   }
 }

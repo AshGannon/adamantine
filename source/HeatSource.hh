@@ -54,7 +54,7 @@ public:
    */
   HeatSource(boost::property_tree::ptree const &beam_database,
              boost::optional<boost::property_tree::ptree const &> const
-                 &units_optional_database)
+                 &units_optional_database = {})
       : _beam(beam_database, units_optional_database),
         // PropertyTreeInput sources.beam_X.scan_path_file
         // PropertyTreeInput sources.beam_X.scan_path_format

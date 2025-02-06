@@ -521,6 +521,46 @@ void refine_and_transfer(
   }
 }
 
+/*ARG New function*/
+/*template <int dim>
+std::vector<typename dealii::parallel::distributed::Triangulation<
+    dim>::active_cell_iterator>
+compute_cells_to_refine(
+    dealii::parallel::distributed::Triangulation<dim> &triangulation,
+    dealii::DoFHandler<dim> const &dof_handler,
+    dealii::LA::distributed::Vector<double> const &solution,
+    double const T_solidus)
+{
+  // Vector to store cells that need refinement
+  std::vector<typename dealii::parallel::distributed::Triangulation<
+      dim>::active_cell_iterator>
+      cells_to_refine;
+
+  // Loop over all locally owned active cells
+  for (auto const &cell : triangulation.active_cell_iterators() |
+                              dealii::IteratorFilters::LocallyOwnedCell())
+  {
+    // Compute the average temperature over all DoFs in the cell
+    double temperature = 0.0;
+    unsigned int dofs_per_cell = cell->get_fe().dofs_per_cell;
+    std::vector<dealii::types::global_dof_index> local_dof_indices(dofs_per_cell);
+    cell->get_dof_indices(local_dof_indices);
+
+    for (unsigned int i = 0; i < dofs_per_cell; ++i)
+    {
+      temperature += solution[local_dof_indices[i]];
+    }
+    temperature /= dofs_per_cell;
+    
+    // Mark cells for refinement if temperature exceeds 0.9 * T_solidus
+    if (temperature > 0.9 * T_solidus)
+    {
+      cells_to_refine.push_back(cell);
+    }
+  }
+  return cells_to_refine;
+}*/
+
 template <int dim>
 std::vector<typename dealii::parallel::distributed::Triangulation<
     dim>::active_cell_iterator>
@@ -586,6 +626,112 @@ compute_cells_to_refine(
   }
 
   return cells_to_refine;
+}
+
+/*ARG New function*/
+template <int dim, int p_order, typename MaterialStates, typename MemorySpaceType>
+void refine_mesh(
+    std::unique_ptr<adamantine::ThermalPhysicsInterface<dim, MemorySpaceType>>
+        &thermal_physics,
+    std::unique_ptr<adamantine::MechanicalPhysics<
+        dim, p_order, MaterialStates, MemorySpaceType>> &mechanical_physics,
+    adamantine::MaterialProperty<dim, p_order, MaterialStates, MemorySpaceType>
+        &material_properties,
+    dealii::LA::distributed::Vector<double, MemorySpaceType> &solution,
+    boost::property_tree::ptree const &refinement_database)
+{
+  /*This function adapts the mesh resolution based on the temperature. It refines regions where 
+  the temperature is high (above 90% of the solidus temperature) and coarsens regions where the 
+  temperature is low.*/
+
+  // Ensure ghost values are updated so that non-owned indices become available.
+  solution.update_ghost_values();
+
+  // Retrieve solidus temperatures for all materials
+  std::vector<double> T_solidus;
+  for (auto const &material : refinement_database.get_child(""))
+  {
+    if (material.first.find("material_") == 0)
+    {
+      T_solidus.push_back(material.second.get<double>("solidus"));
+    }
+  }
+
+  // Retrieve the DoF handler and triangulation from the thermal physics object
+  dealii::DoFHandler<dim> &dof_handler = thermal_physics->get_dof_handler();
+  dealii::parallel::distributed::Triangulation<dim> &triangulation =
+      dynamic_cast<dealii::parallel::distributed::Triangulation<dim> &>(
+          const_cast<dealii::Triangulation<dim> &>(dof_handler.get_triangulation()));
+
+  // Compute the cells that should be refined based on temperature threshold
+  // NOTE Just using the maximum temp for all materials in this code for now, not sure 
+  // how to handle this for multiple materials
+  // auto cells_to_refine = compute_cells_to_refine(triangulation, dof_handler, solution, *std::max_element(T_solidus.begin(), T_solidus.end()));
+
+  // Loop through all locally owned cells to set refinement and coarsening flags
+  //for (auto cell : triangulation.active_cell_iterators() |
+  //                 dealii::IteratorFilters::LocallyOwnedCell())
+
+  // Loop through all locally owned cells using the DoFHandler's active cell iterators.
+  for (auto cell : dof_handler.active_cell_iterators() |
+                   dealii::IteratorFilters::LocallyOwnedCell())
+  {
+    // Get the temperature of the cell (assuming there is one solution per cell)
+    // unsigned int global_index = cell->active_cell_index();
+    
+    double temperature = 0.0;
+    unsigned int global_index = 0;
+
+    // Determine how many DOFs are associated with the cell
+    const unsigned int expected_dofs = cell->get_fe().n_dofs_per_cell();
+
+    if (expected_dofs == 0)
+    {
+      // If there are no DOFs (e.g., for a cell-based, piecewise constant approximation),
+      // fall back to using the cell's active index.
+      global_index = cell->active_cell_index();
+    }
+    else
+    {
+      // Get the DoF indices for this cell.
+      std::vector<dealii::types::global_dof_index> dof_indices(expected_dofs);
+      cell->get_dof_indices(dof_indices);
+
+      // Use the first DoF index (assuming one temperature value per cell).
+      global_index = dof_indices[0];
+    }
+    
+    // Check if index is locally owned or a ghost entry
+    if (!solution.get_partitioner()->in_local_range(global_index) &&
+        !solution.get_partitioner()->ghost_indices().is_element(global_index))
+    {
+      std::cerr << "Processor " << dealii::Utilities::MPI::this_mpi_process(MPI_COMM_WORLD)
+                << " tried to access index " << global_index
+                << " which is not locally owned or a ghost entry." << std::endl;
+      MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    // Access the temperature safely
+    temperature = solution[global_index];
+    
+    // Set the refinement flag if temperature exceeds 0.9 * max(T_solidus)
+    if (temperature > 0.9 * *std::max_element(T_solidus.begin(), T_solidus.end()))
+    {
+      cell->set_refine_flag();
+    }
+    // Otherwise, set the coarsening flag if the cell is refined (i.e., has levels)
+    else if (cell->level() > 0)
+    {
+      cell->set_coarsen_flag();
+    }
+  }
+
+    // Execute the refinement and transfer the solution onto the new mesh.
+    refine_and_transfer(thermal_physics, mechanical_physics,
+                        material_properties, dof_handler, solution);
+
+  // Recompute the inverse of the mass matrix after refinement
+  thermal_physics->compute_inverse_mass_matrix();
 }
 
 template <int dim, int p_order, int fe_degree, typename MaterialStates,
@@ -1003,9 +1149,11 @@ run(MPI_Comm const &communicator, boost::property_tree::ptree const &database,
     {
       timers[adamantine::refine].start();
       double next_refinement_time = time + time_steps_refinement * time_step;
-      refine_mesh(thermal_physics, mechanical_physics, material_properties,
+      /*refine_mesh(thermal_physics, mechanical_physics, material_properties,
                   temperature, heat_sources, time, next_refinement_time,
-                  time_steps_refinement, refinement_database);
+                  time_steps_refinement, refinement_database);*/
+      refine_mesh(thermal_physics, mechanical_physics, material_properties,
+                  temperature, refinement_database);
       timers[adamantine::refine].stop();
       if ((rank == 0) && (verbose_output == true))
       {
@@ -1789,11 +1937,15 @@ run_ensemble(MPI_Comm const &global_communicator,
         std::unique_ptr<adamantine::MechanicalPhysics<
             dim, p_order, MaterialStates, MemorySpaceType>>
             dummy;
-        refine_mesh(thermal_physics_ensemble[member], dummy,
+        /*refine_mesh(thermal_physics_ensemble[member], dummy,
                     *material_properties_ensemble[member],
                     solution_augmented_ensemble[member].block(base_state),
                     bounding_heat_sources, time, next_refinement_time,
-                    time_steps_refinement, refinement_database);
+                    time_steps_refinement, refinement_database);*/
+          refine_mesh(thermal_physics_ensemble[member], dummy,
+                    *material_properties_ensemble[member],
+                    solution_augmented_ensemble[member].block(base_state),
+                    refinement_database);
         solution_augmented_ensemble[member].collect_sizes();
       }
 

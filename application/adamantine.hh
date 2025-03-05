@@ -662,7 +662,12 @@ void refine_mesh(
   dealii::parallel::distributed::Triangulation<dim> &triangulation =
       dynamic_cast<dealii::parallel::distributed::Triangulation<dim> &>(
           const_cast<dealii::Triangulation<dim> &>(dof_handler.get_triangulation()));
-
+  
+  dealii::IndexSet rw_index_set = solution.locally_owned_elements();
+  rw_index_set.add_indices(solution.get_partitioner()->ghost_indices());
+  dealii::LA::ReadWriteVector<double> rw_solution(rw_index_set);
+  rw_solution.import(solution, dealii::VectorOperation::insert);
+  
   // Compute the cells that should be refined based on temperature threshold
   // NOTE Just using the maximum temp for all materials in this code for now, not sure 
   // how to handle this for multiple materials
@@ -680,55 +685,42 @@ void refine_mesh(
     // unsigned int global_index = cell->active_cell_index();
     
     double temperature = 0.0;
-    unsigned int global_index = 0;
-
     // Determine how many DOFs are associated with the cell
     const unsigned int expected_dofs = cell->get_fe().n_dofs_per_cell();
 
-    if (expected_dofs == 0)
-    {
-      // If there are no DOFs (e.g., for a cell-based, piecewise constant approximation),
-      // fall back to using the cell's active index.
-      global_index = cell->active_cell_index();
-    }
-    else
-    {
-      // Get the DoF indices for this cell.
-      std::vector<dealii::types::global_dof_index> dof_indices(expected_dofs);
-      cell->get_dof_indices(dof_indices);
-
-      // Use the first DoF index (assuming one temperature value per cell).
-      global_index = dof_indices[0];
-    }
+    std::vector<dealii::types::global_dof_index> dof_indices(cell->get_fe().n_dofs_per_cell());
+    cell->get_dof_indices(dof_indices);
     
-    // Check if index is locally owned or a ghost entry
-    if (!solution.get_partitioner()->in_local_range(global_index) &&
-        !solution.get_partitioner()->ghost_indices().is_element(global_index))
-    {
-      std::cerr << "Processor " << dealii::Utilities::MPI::this_mpi_process(MPI_COMM_WORLD)
-                << " tried to access index " << global_index
-                << " which is not locally owned or a ghost entry." << std::endl;
-      MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-
-    // Access the temperature safely
-    temperature = solution[global_index];
+    for (auto dof : dof_indices)
+        temperature += rw_solution[dof];
+    temperature /= dof_indices.size();
     
-    // Set the refinement flag if temperature exceeds 0.9 * max(T_solidus)
     if (temperature > 0.9 * *std::max_element(T_solidus.begin(), T_solidus.end()))
     {
-      cell->set_refine_flag();
+        cell->set_refine_flag();
     }
-    // Otherwise, set the coarsening flag if the cell is refined (i.e., has levels)
     else if (cell->level() > 0)
     {
-      cell->set_coarsen_flag();
+        cell->set_coarsen_flag();
     }
   }
+  dealii::parallel::distributed::SolutionTransfer<dim, dealii::LA::distributed::Vector<double>> solution_transfer(dof_handler);
+  solution_transfer.prepare_for_coarsening_and_refinement(solution);
+  
+  triangulation.execute_coarsening_and_refinement();
+  
+  dealii::LA::distributed::Vector<double, dealii::MemorySpace::Host> solution_host;
+  solution_host.reinit(dof_handler.n_dofs());
+  solution_transfer.interpolate(solution_host);
+  solution_host.update_ghost_values();
+  // Copy the interpolated values back to `solution`
+  solution.import(solution_host, dealii::VectorOperation::insert);
 
+  // Ensure `solution` has up-to-date ghost values
+  solution.update_ghost_values();
     // Execute the refinement and transfer the solution onto the new mesh.
-    refine_and_transfer(thermal_physics, mechanical_physics,
-                        material_properties, dof_handler, solution);
+  //refine_and_transfer(thermal_physics, mechanical_physics,
+  //                    material_properties, dof_handler, solution);
 
   // Recompute the inverse of the mass matrix after refinement
   thermal_physics->compute_inverse_mass_matrix();

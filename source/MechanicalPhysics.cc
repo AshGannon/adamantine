@@ -19,6 +19,15 @@
 #include <caliper/cali.h>
 #endif
 
+// FOR DEBUGGING
+#include <iostream>
+#include <algorithm>
+#include <exception>
+#include <fstream>
+#include <limits>
+#include <deal.II/lac/precondition.h>
+// --
+
 namespace adamantine
 {
 template <int dim, int n_materials, int p_order, typename MaterialStates,
@@ -127,11 +136,48 @@ void MechanicalPhysics<dim, n_materials, p_order, MaterialStates,
   _affine_constraints.reinit(locally_owned_dofs, locally_relevant_dofs);
   dealii::DoFTools::make_hanging_node_constraints(_dof_handler,
                                                   _affine_constraints);
-
+  // ---- DEBUG: save the number of hanging nodes so you can see the mechanic DoFs later ----
+  auto const n_hanging_constraints =
+    _affine_constraints.n_constraints();
+  // ---- END DEBUG ----
   std::map<dealii::types::boundary_id, const dealii::Function<dim> *>
       boundary_function_map;
   dealii::Functions::ZeroFunction<dim> zero_function(dim);
   auto boundary_ids = _boundary.get_boundary_ids(BoundaryType::clamped);
+  // ---- DEBUG: count faces assigned to clamped boundary IDs ----
+  std::map<dealii::types::boundary_id, unsigned int> clamped_face_count;
+  for (auto const &cell : _dof_handler.active_cell_iterators())
+  {
+    if (!cell->is_locally_owned() || cell->active_fe_index() != 0)
+      continue;
+
+    for (unsigned int f = 0;
+         f < dealii::GeometryInfo<dim>::faces_per_cell;
+         ++f)
+    {
+      if (cell->face(f)->at_boundary())
+      {
+        auto const id = cell->face(f)->boundary_id();
+
+        if (std::find(boundary_ids.begin(), boundary_ids.end(), id) != boundary_ids.end())
+        {
+          ++clamped_face_count[id];
+        }
+      }
+    }
+  }
+
+  for (auto const &[id, count] : clamped_face_count)
+  {
+    std::cout << "Clamped boundary "
+              << static_cast<unsigned int>(id)
+              << ": "
+              << count
+              << " locally owned faces"
+              << std::endl;
+  }
+  // ---- END DEBUG ----
+  
   for (auto id : boundary_ids)
   {
     boundary_function_map[id] = &zero_function;
@@ -139,7 +185,24 @@ void MechanicalPhysics<dim, n_materials, p_order, MaterialStates,
   dealii::VectorTools::interpolate_boundary_values(
       _dof_handler, boundary_function_map, _affine_constraints);
   _affine_constraints.close();
+  
+  // ---- DEBUG: Count number of mechanical DOFs ----
+  auto const n_total_constraints =
+    _affine_constraints.n_constraints();
 
+  std::cout << "Hanging-node constraints: "
+            << n_hanging_constraints
+            << std::endl;
+
+  std::cout << "Total constraints: "
+            << n_total_constraints
+            << std::endl;
+
+  std::cout << "Constraints added by clamped BC: "
+            << n_total_constraints - n_hanging_constraints
+            << std::endl;
+  // ---- END DEBUG ----
+  
   _mechanical_operator->reinit(_dof_handler, _affine_constraints, _q_collection,
                                body_forces);
 }
@@ -524,16 +587,254 @@ MechanicalPhysics<dim, n_materials, p_order, MaterialStates,
   rw_vector.import_elements(_mechanical_operator->rhs(),
                             dealii::VectorOperation::insert);
   rhs_device.import_elements(rw_vector, dealii::VectorOperation::insert);
+  // ---- DEBUG: Solver diagnostics ---
+  int const mpi_rank = dealii::Utilities::MPI::this_mpi_process(
+        _mechanical_operator->rhs().get_mpi_communicator());
+  // Give each mechanical solve a unique ID.
+  // solve() currently does not know the global simulation timestep.
+  static unsigned long mechanical_solve_id = 0;
+  unsigned long const this_solve_id = mechanical_solve_id++;
+  double const rhs_norm =
+      _mechanical_operator->rhs().l2_norm();
+  // raw stiffness-matrix spectral diagnostic on the problematic matrix
+  if (_dof_handler.n_dofs() == 85356)
+  {
+    dealii::SolverControl spectral_control(200, 0.0);
 
+    dealii::SolverCG<TrilinosVectorType> spectral_cg(
+        spectral_control);
+
+    std::vector<double> raw_eigenvalues;
+
+    double raw_condition =
+        std::numeric_limits<double>::quiet_NaN();
+
+    auto eigen_connection =
+        spectral_cg.connect_eigenvalues_slot(
+            [&raw_eigenvalues](
+                std::vector<double> const &eigenvalues)
+            {
+              raw_eigenvalues = eigenvalues;
+            });
+
+    auto condition_connection =
+        spectral_cg.connect_condition_number_slot(
+            [&raw_condition](double const condition)
+            {
+              raw_condition = condition;
+            });
+
+    // Separate solution vector so this diagnostic does NOT
+    // modify the real mechanical solution.
+    TrilinosVectorType diagnostic_solution(
+        locally_owned_dofs,
+        _mechanical_operator->rhs().get_mpi_communicator());
+
+    diagnostic_solution = 0.0;
+
+    try
+    {
+      spectral_cg.solve(
+          _mechanical_operator->system_matrix(),
+          diagnostic_solution,
+          rhs_device,
+          dealii::PreconditionIdentity());
+    }
+    catch (dealii::SolverControl::NoConvergence const &)
+    {
+      // Expected. We only asked for 200 iterations because
+      // we're interested in the Lanczos/Ritz estimates.
+    }
+    catch (std::exception const &e)
+    {
+      if (mpi_rank == 0)
+        std::cerr
+            << "Raw-matrix spectral diagnostic failed: "
+            << e.what() << std::endl;
+    }
+
+    if (mpi_rank == 0 && !raw_eigenvalues.empty())
+    {
+      auto const minmax =
+          std::minmax_element(raw_eigenvalues.begin(),
+                              raw_eigenvalues.end());
+
+      bool const file_exists =
+          static_cast<bool>(
+              std::ifstream("raw_matrix_spectrum.csv"));
+
+      std::ofstream out("raw_matrix_spectrum.csv",
+                        std::ios::app);
+
+      if (!file_exists)
+      {
+        out << "solve_id,n_dofs,rhs_norm,"
+               "lambda_min_estimate,"
+               "lambda_max_estimate,"
+               "condition_estimate\n";
+      }
+
+        out << this_solve_id << ","
+            << _dof_handler.n_dofs() << ","
+            << rhs_norm << ","
+            << *minmax.first << ","
+            << *minmax.second << ","
+            << raw_condition << "\n";
+    }
+  }
+  // ---- END DEBUG ----
+  
   // Solve the mechanical problem assuming that the deformation is elastic
   // TODO check that we are computing only difference of the displacement
   // compared to the previous time step!!
   unsigned int const max_iter = _dof_handler.n_dofs() / 10;
-  double const tol = 1e-12 * _mechanical_operator->rhs().l2_norm();
+  double const tol = 1e-12 * rhs_norm;
+  // ---- DEBUG: Solver diagnostics ----
+  std::cout << "Mechanical n_dofs: "
+          << _dof_handler.n_dofs() << std::endl;
+  std::cout << "Mechanical rhs norm: "
+            << _mechanical_operator->rhs().l2_norm() << std::endl;
+  std::cout << "Mechanical tolerance: "
+            << tol << std::endl;
+  std::cout << "Mechanical max iterations: "
+            << max_iter << std::endl;
+  // ---- END DEBUG ----
   dealii::SolverControl solver_control(max_iter, tol);
+  // ---- DEBUG: Save residual at every CG iteration ----
+  solver_control.enable_history_data();
+  // ---- END DEBUG ----
+  
   dealii::SolverCG<TrilinosVectorType> cg(solver_control);
-  cg.solve(_mechanical_operator->system_matrix(), displacement, rhs_device,
-           _mechanical_operator->preconditioner());
+  
+  // ---- DEBUG: Save residual at every CG iteration ----
+  // These are estimates for the AMG-PRECONDITIONED operator.
+  double estimated_condition =
+      std::numeric_limits<double>::quiet_NaN();
+
+  std::vector<double> estimated_eigenvalues;
+
+  auto condition_connection =
+      cg.connect_condition_number_slot(
+          [&estimated_condition](double const condition)
+          {
+            estimated_condition = condition;
+          });
+
+  auto eigenvalue_connection =
+      cg.connect_eigenvalues_slot(
+          [&estimated_eigenvalues](std::vector<double> const &eigenvalues)
+          {
+            estimated_eigenvalues = eigenvalues;
+          });
+
+  std::exception_ptr cg_exception;
+
+  try
+  {
+    cg.solve(_mechanical_operator->system_matrix(),
+             displacement,
+             rhs_device,
+             _mechanical_operator->preconditioner());
+  }
+  catch (...)
+  {
+    // Save the exception so we can write diagnostics BEFORE terminating.
+    cg_exception = std::current_exception();
+  }
+
+  // -------- write CG residual history --------
+  auto const &residual_history = solver_control.get_history_data();
+  if (mpi_rank == 0)
+  {
+    // One line per CG iteration.
+    {
+      bool const file_exists =
+          static_cast<bool>(std::ifstream("cg_residuals.csv"));
+
+      std::ofstream out("cg_residuals.csv", std::ios::app);
+
+      if (!file_exists)
+      {
+        out << "solve_id,n_dofs,iteration,residual,"
+               "relative_residual\n";
+      }
+
+      for (unsigned int i = 0;
+           i < residual_history.size();
+           ++i)
+      {
+        double const residual = residual_history[i];
+
+        out << this_solve_id << ","
+            << _dof_handler.n_dofs() << ","
+            << i << ","
+            << residual << ","
+            << ((rhs_norm > 0.0)
+                  ? residual / rhs_norm
+                  : std::numeric_limits<double>::quiet_NaN())
+            << "\n";
+      }
+    }
+
+    // One summary line per mechanical solve.
+    {
+      bool const file_exists =
+          static_cast<bool>(std::ifstream("cg_summary.csv"));
+
+      std::ofstream out("cg_summary.csv", std::ios::app);
+
+      if (!file_exists)
+      {
+        out << "solve_id,n_dofs,rhs_norm,tolerance,"
+               "iterations,final_residual,"
+               "condition_estimate,lambda_min_estimate,"
+               "lambda_max_estimate,status\n";
+      }
+
+      double lambda_min =
+          std::numeric_limits<double>::quiet_NaN();
+
+      double lambda_max =
+          std::numeric_limits<double>::quiet_NaN();
+
+      if (!estimated_eigenvalues.empty())
+      {
+        auto const minmax =
+            std::minmax_element(estimated_eigenvalues.begin(),
+                                estimated_eigenvalues.end());
+
+        lambda_min = *minmax.first;
+        lambda_max = *minmax.second;
+      }
+
+      double const final_residual =
+          residual_history.empty()
+              ? std::numeric_limits<double>::quiet_NaN()
+              : residual_history.back();
+
+      out << this_solve_id << ","
+          << _dof_handler.n_dofs() << ","
+          << rhs_norm << ","
+          << tol << ","
+          << solver_control.last_step() << ","
+          << final_residual << ","
+          << estimated_condition << ","
+          << lambda_min << ","
+          << lambda_max << ","
+          << (cg_exception ? "failed" : "converged")
+          << "\n";
+    }
+  }
+
+  // Delay the exception so the failed solve is still written to the CSV file
+  if (cg_exception)
+  {
+    std::rethrow_exception(cg_exception);
+  }
+  // ---- END DEBUG ----
+  
+  //cg.solve(_mechanical_operator->system_matrix(), displacement, rhs_device,
+  //         _mechanical_operator->preconditioner());
 
   rw_vector.import_elements(displacement, dealii::VectorOperation::insert);
   dealii::LA::distributed::Vector<double, dealii::MemorySpace::Host>

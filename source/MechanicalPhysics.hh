@@ -175,6 +175,22 @@ private:
    */
   dealii::LA::distributed::Vector<double, dealii::MemorySpace::Host>
       _old_displacement;
+  
+  /**
+   * Orthonormal rigid-body modes associated with mechanically active
+   * connected components that do not touch a clamped boundary.
+   *
+   * These modes are rebuilt whenever setup_dofs() rebuilds the mechanical
+   * DoFHandler and are projected out of the linear solve. This lets a
+   * quasi-static elasticity solve retain the deformation/stress of a
+   * floating solid component without arbitrarily pinning one of its nodes.
+   *
+   * The current experimental component finder in MechanicalPhysics.cc is
+   * limited to one MPI rank and a conforming mesh.
+   */
+  std::vector<
+      dealii::LA::distributed::Vector<double, dealii::MemorySpace::Host>>
+      _floating_rigid_body_modes;
 
   /**
    * Plastic internal variable related to the strain

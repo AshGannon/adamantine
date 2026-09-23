@@ -349,8 +349,31 @@ void MechanicalOperator<dim, n_materials, p_order, MaterialStates,
 #ifdef ADAMANTINE_WITH_CALIPER
   CALI_MARK_BEGIN("initialize mechanical matrix preconditioner");
 #endif
+  // ---- DEBUG: specifying the elastic problem in the preconditioner ----
+  // For mechanics, we have dim displacement components: ux, uy, uz in 3D.
+  dealii::FEValuesExtractors::Vector const displacement_components(0);
+  auto const component_mask =
+      _dof_handler->get_fe_collection().component_mask(
+          displacement_components);
+  std::vector<std::vector<bool>> constant_modes;
+  dealii::DoFTools::extract_constant_modes(
+      *_dof_handler,
+      component_mask,
+      constant_modes);
+
+  typename TrilinosPreconditionerType::AdditionalData amg_data;
+  amg_data.constant_modes = constant_modes;
+  // Print out the number of displacement components
+  if (dealii::Utilities::MPI::this_mpi_process(_communicator) == 0)
+  {
+    std::cout << "AMG elasticity constant modes: "
+              << constant_modes.size() << std::endl;
+  }
+  // ---- END DEBUG ----
   _preconditioner.clear();
-  _preconditioner.initialize(_system_matrix);
+  // ---- DEBUG: add amg data to preconditioner ----
+  _preconditioner.initialize(_system_matrix, amg_data);  
+  // ---- END DEBUG ----
 #ifdef ADAMANTINE_WITH_CALIPER
   CALI_MARK_END("initialize mechanical matrix preconditioner");
 #endif

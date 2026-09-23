@@ -10,6 +10,7 @@
 #include <deal.II/dofs/dof_tools.h>
 #include <deal.II/fe/fe_nothing.h>
 #include <deal.II/fe/fe_q.h>
+#include <deal.II/fe/mapping_q1.h>
 #include <deal.II/hp/fe_values.h>
 #include <deal.II/lac/la_parallel_vector.h>
 #include <deal.II/lac/solver_cg.h>
@@ -22,11 +23,91 @@
 // FOR DEBUGGING
 #include <iostream>
 #include <algorithm>
+#include <cmath>
+#include <map>
 #include <exception>
 #include <fstream>
 #include <limits>
 #include <deal.II/lac/precondition.h>
 // --
+
+namespace
+{
+template <typename VectorType>
+double
+project_out_nullspace(VectorType &vector,
+                      std::vector<VectorType> const &nullspace_modes)
+{
+  double removed_norm_squared = 0.0;
+
+  for (auto const &mode : nullspace_modes)
+  {
+    double const coefficient = mode * vector;
+    removed_norm_squared += coefficient * coefficient;
+    vector.add(-coefficient, mode);
+  }
+
+  return std::sqrt(removed_norm_squared);
+}
+
+template <typename MatrixType, typename VectorType>
+class NullspaceProjectedOperator
+{
+public:
+  NullspaceProjectedOperator(
+      MatrixType const &matrix,
+      std::vector<VectorType> const &nullspace_modes,
+      dealii::IndexSet const &locally_owned_dofs,
+      MPI_Comm const communicator)
+      : _matrix(matrix), _nullspace_modes(nullspace_modes),
+        _scratch(locally_owned_dofs, communicator)
+  {
+  }
+
+  void vmult(VectorType &dst, VectorType const &src) const
+  {
+    _scratch = src;
+    project_out_nullspace(_scratch, _nullspace_modes);
+
+    _matrix.vmult(dst, _scratch);
+    project_out_nullspace(dst, _nullspace_modes);
+  }
+
+private:
+  MatrixType const &_matrix;
+  std::vector<VectorType> const &_nullspace_modes;
+  mutable VectorType _scratch;
+};
+
+template <typename PreconditionerType, typename VectorType>
+class NullspaceProjectedPreconditioner
+{
+public:
+  NullspaceProjectedPreconditioner(
+      PreconditionerType const &preconditioner,
+      std::vector<VectorType> const &nullspace_modes,
+      dealii::IndexSet const &locally_owned_dofs,
+      MPI_Comm const communicator)
+      : _preconditioner(preconditioner), _nullspace_modes(nullspace_modes),
+        _scratch(locally_owned_dofs, communicator)
+  {
+  }
+
+  void vmult(VectorType &dst, VectorType const &src) const
+  {
+    _scratch = src;
+    project_out_nullspace(_scratch, _nullspace_modes);
+
+    _preconditioner.vmult(dst, _scratch);
+    project_out_nullspace(dst, _nullspace_modes);
+  }
+
+private:
+  PreconditionerType const &_preconditioner;
+  std::vector<VectorType> const &_nullspace_modes;
+  mutable VectorType _scratch;
+};
+} // namespace
 
 namespace adamantine
 {
@@ -185,6 +266,329 @@ void MechanicalPhysics<dim, n_materials, p_order, MaterialStates,
   dealii::VectorTools::interpolate_boundary_values(
       _dof_handler, boundary_function_map, _affine_constraints);
   _affine_constraints.close();
+
+  // ---- DEBUG/EXPERIMENT: identify floating mechanical components ----------
+  //
+  // A face-connected collection of FE-index-0 cells that does not touch a
+  // clamped boundary is a floating elastic body. In 3D such a body has six
+  // rigid-body null modes (three translations + three rotations); in 2D it
+  // has three. We construct those modes here and later project them out of the
+  // linear solve instead of pinning an arbitrary node.
+  //
+  // This first implementation is intentionally limited to the current
+  // single-MPI-rank, conforming-mesh debugging case.
+  _floating_rigid_body_modes.clear();
+
+#if DEAL_II_VERSION_GTE(9, 7, 0)
+  MPI_Comm const mechanics_communicator = _dof_handler.get_mpi_communicator();
+#else
+  MPI_Comm const mechanics_communicator = _dof_handler.get_communicator();
+#endif
+
+  unsigned int const n_mpi_processes =
+      dealii::Utilities::MPI::n_mpi_processes(mechanics_communicator);
+
+  if (n_mpi_processes == 1 && n_hanging_constraints == 0)
+  {
+    using CellIterator =
+        typename dealii::DoFHandler<dim>::active_cell_iterator;
+
+    std::vector<CellIterator> mechanical_cells;
+    for (auto const &cell : _dof_handler.active_cell_iterators())
+    {
+      if (cell->is_locally_owned() && cell->active_fe_index() == 0)
+        mechanical_cells.push_back(cell);
+    }
+
+    unsigned int const n_mechanical_cells = mechanical_cells.size();
+
+    std::vector<unsigned int> parent(n_mechanical_cells);
+    for (unsigned int i = 0; i < n_mechanical_cells; ++i)
+      parent[i] = i;
+
+    auto find_root = [&parent](unsigned int i)
+    {
+      while (parent[i] != i)
+      {
+        parent[i] = parent[parent[i]];
+        i = parent[i];
+      }
+      return i;
+    };
+
+    auto unite = [&parent, &find_root](unsigned int a, unsigned int b)
+    {
+      a = find_root(a);
+      b = find_root(b);
+
+      if (a != b)
+        parent[b] = a;
+    };
+
+    std::map<unsigned int, unsigned int> face_owner;
+    std::vector<bool> cell_touches_clamp(n_mechanical_cells, false);
+
+    for (unsigned int i = 0; i < n_mechanical_cells; ++i)
+    {
+      auto const &cell = mechanical_cells[i];
+
+      for (unsigned int f = 0;
+           f < dealii::GeometryInfo<dim>::faces_per_cell;
+           ++f)
+      {
+        auto const face = cell->face(f);
+
+        if (face->at_boundary())
+        {
+          auto const boundary_id = face->boundary_id();
+
+          if (std::find(boundary_ids.begin(),
+                        boundary_ids.end(),
+                        boundary_id) != boundary_ids.end())
+            cell_touches_clamp[i] = true;
+        }
+        else
+        {
+          unsigned int const face_index = face->index();
+          auto const result = face_owner.emplace(face_index, i);
+
+          if (!result.second)
+            unite(i, result.first->second);
+        }
+      }
+    }
+
+    struct ComponentInfo
+    {
+      std::vector<unsigned int> cell_indices;
+      bool touches_clamped_boundary = false;
+    };
+
+    std::map<unsigned int, ComponentInfo> components;
+    for (unsigned int i = 0; i < n_mechanical_cells; ++i)
+    {
+      unsigned int const root = find_root(i);
+      components[root].cell_indices.push_back(i);
+      components[root].touches_clamped_boundary =
+          components[root].touches_clamped_boundary ||
+          cell_touches_clamp[i];
+    }
+
+    // deal.II 9.6.x does not provide
+    // DoFTools::extract_rigid_body_modes(), so construct the rigid-body
+    // displacement fields explicitly. DoFTools::map_dofs_to_support_points()
+    // is available in deal.II 9.6 and gives the real-space coordinate of each
+    // displacement DoF. For r measured from the floating-component center,
+    // the rigid modes are translations and omega x r rotations.
+    dealii::MappingQ1<dim> mapping;
+    auto const support_points =
+        dealii::DoFTools::map_dofs_to_support_points(mapping, _dof_handler);
+
+    dealii::IndexSet const locally_owned_dofs =
+        _dof_handler.locally_owned_dofs();
+    dealii::IndexSet const locally_relevant_dofs =
+        dealii::DoFTools::extract_locally_relevant_dofs(_dof_handler);
+
+    std::vector<dealii::types::global_dof_index> local_dof_indices(
+        _dof_handler.get_fe_collection().max_dofs_per_cell());
+
+    unsigned int floating_component_number = 0;
+
+    for (auto const &[root, component] : components)
+    {
+      (void)root;
+
+      if (component.touches_clamped_boundary)
+        continue;
+
+      // Record which global DoFs belong to this floating component and which
+      // displacement component (x/y/z) each DoF represents. The active
+      // mechanical element is FESystem(FE_Q ^ dim), so every shape function is
+      // primitive and system_to_component_index() is well defined.
+      std::vector<bool> component_dofs(_dof_handler.n_dofs(), false);
+      std::vector<unsigned int> dof_components(_dof_handler.n_dofs(), dim);
+
+      for (auto const cell_index : component.cell_indices)
+      {
+        auto const &cell = mechanical_cells[cell_index];
+        auto const &fe = cell->get_fe();
+        unsigned int const dofs_per_cell = fe.n_dofs_per_cell();
+
+        cell->get_dof_indices(local_dof_indices);
+
+        for (unsigned int i = 0; i < dofs_per_cell; ++i)
+        {
+          auto const dof = local_dof_indices[i];
+          component_dofs[dof] = true;
+          dof_components[dof] = fe.system_to_component_index(i).first;
+        }
+      }
+
+      // Express rotations about the component center rather than the global
+      // origin. A change of rotation center only adds a translation, so the
+      // nullspace span is unchanged; centering just improves scaling before
+      // Gram-Schmidt orthonormalization.
+      dealii::Point<dim> component_center;
+      unsigned int n_component_dofs_with_support_point = 0;
+
+      for (auto const dof : locally_owned_dofs)
+      {
+        if (!component_dofs[dof])
+          continue;
+
+        auto const point = support_points.find(dof);
+        if (point == support_points.end())
+          continue;
+
+        for (unsigned int d = 0; d < dim; ++d)
+          component_center[d] += point->second[d];
+        ++n_component_dofs_with_support_point;
+      }
+
+      if (n_component_dofs_with_support_point == 0)
+      {
+        std::cout << "WARNING: floating mechanical component "
+                  << floating_component_number
+                  << " has no mapped support points; rigid-mode projection "
+                     "is skipped for this component."
+                  << std::endl;
+        ++floating_component_number;
+        continue;
+      }
+
+      for (unsigned int d = 0; d < dim; ++d)
+        component_center[d] /=
+            static_cast<double>(n_component_dofs_with_support_point);
+
+      // Number of rigid motions = translations + independent rotations:
+      // 1 in 1D, 3 in 2D, and 6 in 3D.
+      unsigned int const n_rigid_body_modes =
+          dim + dim * (dim - 1) / 2;
+      unsigned int modes_added_for_component = 0;
+
+      for (unsigned int rigid_mode = 0;
+           rigid_mode < n_rigid_body_modes;
+           ++rigid_mode)
+      {
+        dealii::LA::distributed::Vector<double, dealii::MemorySpace::Host>
+            mode(locally_owned_dofs,
+                 locally_relevant_dofs,
+                 mechanics_communicator);
+
+        for (auto const dof : locally_owned_dofs)
+        {
+          if (!component_dofs[dof])
+            continue;
+
+          auto const point = support_points.find(dof);
+          if (point == support_points.end())
+            continue;
+
+          unsigned int const displacement_component = dof_components[dof];
+          if (displacement_component >= dim)
+            continue;
+
+          dealii::Tensor<1, dim> r;
+          for (unsigned int d = 0; d < dim; ++d)
+            r[d] = point->second[d] - component_center[d];
+
+          double value = 0.0;
+
+          if (rigid_mode < dim)
+          {
+            // Translation in coordinate direction rigid_mode.
+            if (displacement_component == rigid_mode)
+              value = 1.0;
+          }
+          else if constexpr (dim == 2)
+          {
+            // One in-plane rotation: omega_z x r = (-r_y, r_x).
+            if (displacement_component == 0)
+              value = -r[1];
+            else if (displacement_component == 1)
+              value = r[0];
+          }
+          else if constexpr (dim == 3)
+          {
+            unsigned int const rotation_axis = rigid_mode - dim;
+
+            // omega_x x r = (0, -r_z, r_y)
+            if (rotation_axis == 0)
+            {
+              if (displacement_component == 1)
+                value = -r[2];
+              else if (displacement_component == 2)
+                value = r[1];
+            }
+            // omega_y x r = (r_z, 0, -r_x)
+            else if (rotation_axis == 1)
+            {
+              if (displacement_component == 0)
+                value = r[2];
+              else if (displacement_component == 2)
+                value = -r[0];
+            }
+            // omega_z x r = (-r_y, r_x, 0)
+            else if (rotation_axis == 2)
+            {
+              if (displacement_component == 0)
+                value = -r[1];
+              else if (displacement_component == 1)
+                value = r[0];
+            }
+          }
+
+          mode[dof] = value;
+        }
+
+        mode.compress(dealii::VectorOperation::insert);
+
+        // Modified Gram-Schmidt. Modes from genuinely disconnected
+        // components have disjoint support; modes on one component still need
+        // orthogonalization, especially rotations versus translations.
+        for (auto const &existing_mode : _floating_rigid_body_modes)
+        {
+          double const coefficient = existing_mode * mode;
+          mode.add(-coefficient, existing_mode);
+        }
+
+        double const mode_norm = mode.l2_norm();
+
+        if (mode_norm > 1.e-14)
+        {
+          mode /= mode_norm;
+          _floating_rigid_body_modes.push_back(mode);
+          ++modes_added_for_component;
+        }
+      }
+
+      std::cout << "Floating mechanical component "
+                << floating_component_number
+                << ": cells = " << component.cell_indices.size()
+                << ", rigid-body modes = " << modes_added_for_component
+                << std::endl;
+
+      ++floating_component_number;
+    }
+
+    std::cout << "Mechanical active components: "
+              << components.size()
+              << ", floating components: "
+              << floating_component_number
+              << ", projected rigid-body modes: "
+              << _floating_rigid_body_modes.size()
+              << std::endl;
+  }
+  else
+  {
+    std::cout
+        << "Floating-component nullspace projection is currently implemented "
+        << "only for one MPI rank with no hanging-node constraints; "
+        << "projection is disabled for this mechanical system."
+        << std::endl;
+  }
+  // ---- END DEBUG/EXPERIMENT ---------------------------------------------
+
   
   // ---- DEBUG: Count number of mechanical DOFs ----
   auto const n_total_constraints =
@@ -594,7 +998,7 @@ MechanicalPhysics<dim, n_materials, p_order, MaterialStates,
   // solve() currently does not know the global simulation timestep.
   static unsigned long mechanical_solve_id = 0;
   unsigned long const this_solve_id = mechanical_solve_id++;
-  double const rhs_norm =
+  double const raw_rhs_norm =
       _mechanical_operator->rhs().l2_norm();
   // raw stiffness-matrix spectral diagnostic on the problematic matrix
   if (_dof_handler.n_dofs() == 85356)
@@ -676,7 +1080,7 @@ MechanicalPhysics<dim, n_materials, p_order, MaterialStates,
 
         out << this_solve_id << ","
             << _dof_handler.n_dofs() << ","
-            << rhs_norm << ","
+            << raw_rhs_norm << ","
             << *minmax.first << ","
             << *minmax.second << ","
             << raw_condition << "\n";
@@ -684,6 +1088,69 @@ MechanicalPhysics<dim, n_materials, p_order, MaterialStates,
   }
   // ---- END DEBUG ----
   
+  // Convert the host-side rigid-body basis to the Trilinos vector type used
+  // by SolverCG.
+  std::vector<TrilinosVectorType> floating_rigid_body_modes;
+  floating_rigid_body_modes.reserve(_floating_rigid_body_modes.size());
+
+  for (auto const &host_mode : _floating_rigid_body_modes)
+  {
+    dealii::LinearAlgebra::ReadWriteVector<double> rw_mode(locally_owned_dofs);
+    rw_mode.import_elements(host_mode, dealii::VectorOperation::insert);
+
+    floating_rigid_body_modes.emplace_back(
+        locally_owned_dofs,
+        _mechanical_operator->rhs().get_mpi_communicator());
+    floating_rigid_body_modes.back().import_elements(
+        rw_mode, dealii::VectorOperation::insert);
+  }
+
+  // A compatible static elasticity load should be orthogonal to the rigid-body
+  // nullspace. Projecting the RHS enforces that compatibility. If the removed
+  // part is not tiny, the floating body carries a net force/torque that the
+  // quasi-static model cannot physically balance.
+  double const removed_rhs_norm =
+      project_out_nullspace(rhs_device, floating_rigid_body_modes);
+  double const rhs_norm = rhs_device.l2_norm();
+
+  if (mpi_rank == 0 && !floating_rigid_body_modes.empty())
+  {
+    std::cout << "Projected rigid-body modes: "
+              << floating_rigid_body_modes.size() << std::endl;
+    std::cout << "Mechanical RHS norm before projection: "
+              << raw_rhs_norm << std::endl;
+    std::cout << "Rigid-body RHS component removed: "
+              << removed_rhs_norm << std::endl;
+    std::cout << "Mechanical RHS norm after projection: "
+              << rhs_norm << std::endl;
+
+    if (raw_rhs_norm > 0.0 &&
+        removed_rhs_norm / raw_rhs_norm > 1.e-8)
+      std::cout
+          << "WARNING: projection removed a non-negligible rigid-body load. "
+          << "This is more than a gauge choice; the quasi-static model is "
+          << "discarding net force/torque on a floating component."
+          << std::endl;
+
+    // Verify that each candidate really is close to a null vector of the
+    // assembled stiffness matrix.
+    TrilinosVectorType Az(
+        locally_owned_dofs,
+        _mechanical_operator->rhs().get_mpi_communicator());
+
+    for (unsigned int i = 0; i < floating_rigid_body_modes.size(); ++i)
+    {
+      _mechanical_operator->system_matrix().vmult(
+          Az, floating_rigid_body_modes[i]);
+
+      std::cout << "Rigid-body mode " << i
+                << ": ||A z|| = " << Az.l2_norm()
+                << ", z^T A z = "
+                << (floating_rigid_body_modes[i] * Az)
+                << std::endl;
+    }
+  }
+
   // Solve the mechanical problem assuming that the deformation is elastic
   // TODO check that we are computing only difference of the displacement
   // compared to the previous time step!!
@@ -692,8 +1159,8 @@ MechanicalPhysics<dim, n_materials, p_order, MaterialStates,
   // ---- DEBUG: Solver diagnostics ----
   std::cout << "Mechanical n_dofs: "
           << _dof_handler.n_dofs() << std::endl;
-  std::cout << "Mechanical rhs norm: "
-            << _mechanical_operator->rhs().l2_norm() << std::endl;
+  std::cout << "Mechanical rhs norm used by solver: "
+            << rhs_norm << std::endl;
   std::cout << "Mechanical tolerance: "
             << tol << std::endl;
   std::cout << "Mechanical max iterations: "
@@ -731,10 +1198,45 @@ MechanicalPhysics<dim, n_materials, p_order, MaterialStates,
 
   try
   {
-    cg.solve(_mechanical_operator->system_matrix(),
-             displacement,
-             rhs_device,
-             _mechanical_operator->preconditioner());
+    if (floating_rigid_body_modes.empty())
+    {
+      cg.solve(_mechanical_operator->system_matrix(),
+               displacement,
+               rhs_device,
+               _mechanical_operator->preconditioner());
+    }
+    else
+    {
+      using MechanicalOperatorType =
+          MechanicalOperator<dim, n_materials, p_order, MaterialStates,
+                             MemorySpaceType>;
+      using MatrixType =
+          typename MechanicalOperatorType::TrilinosMatrixType;
+      using PreconditionerType =
+          typename MechanicalOperatorType::TrilinosPreconditionerType;
+
+      NullspaceProjectedOperator<MatrixType, TrilinosVectorType>
+          projected_matrix(
+              _mechanical_operator->system_matrix(),
+              floating_rigid_body_modes,
+              locally_owned_dofs,
+              _mechanical_operator->rhs().get_mpi_communicator());
+
+      NullspaceProjectedPreconditioner<PreconditionerType, TrilinosVectorType>
+          projected_preconditioner(
+              _mechanical_operator->preconditioner(),
+              floating_rigid_body_modes,
+              locally_owned_dofs,
+              _mechanical_operator->rhs().get_mpi_communicator());
+
+      cg.solve(projected_matrix,
+               displacement,
+               rhs_device,
+               projected_preconditioner);
+
+      // Return a displacement with exactly the same zero-rigid-motion gauge.
+      project_out_nullspace(displacement, floating_rigid_body_modes);
+    }
   }
   catch (...)
   {

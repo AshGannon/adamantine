@@ -110,7 +110,11 @@ private:
   void compute_stress(
       dealii::LA::distributed::Vector<double, dealii::MemorySpace::Host> const
           &displacement);
-
+  
+  // Detect mechanically disconnected solid components and construct their
+  // rigid-body null modes. Called only after the ordinary CG solve fails.
+  void detect_floating_rigid_body_modes();
+  
   /**
    * Associated Geometry.
    */
@@ -180,10 +184,7 @@ private:
    * Orthonormal rigid-body modes associated with mechanically active
    * connected components that do not touch a clamped boundary.
    *
-   * These modes are rebuilt whenever setup_dofs() rebuilds the mechanical
-   * DoFHandler and are projected out of the linear solve. This lets a
-   * quasi-static elasticity solve retain the deformation/stress of a
-   * floating solid component without arbitrarily pinning one of its nodes.
+   * These modes are constructed when mechanical CG solve fails
    *
    * The current experimental component finder in MechanicalPhysics.cc is
    * limited to one MPI rank and a conforming mesh.

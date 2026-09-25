@@ -279,69 +279,6 @@ void MechanicalOperator<dim, n_materials, p_order, MaterialStates,
                                 dealii::MeshWorker::assemble_own_cells);
 
   _system_matrix.compress(dealii::VectorOperation::add);
-  // ---- DEBUG: for matrix symmetry testing ----
-  // locally_owned_dofs was already defined near the top of assemble_matrix()
-  dealii::TrilinosWrappers::MPI::Vector x(locally_owned_dofs, _communicator);
-  dealii::TrilinosWrappers::MPI::Vector y(locally_owned_dofs, _communicator);
-  dealii::TrilinosWrappers::MPI::Vector Ax(locally_owned_dofs, _communicator);
-  dealii::TrilinosWrappers::MPI::Vector Ay(locally_owned_dofs, _communicator);
-
-  // Use deterministic, nonzero test vectors.
-  // Different formulas are used so x and y are not just multiples of each other.
-  dealii::LinearAlgebra::ReadWriteVector<double> rw_x(locally_owned_dofs);
-  dealii::LinearAlgebra::ReadWriteVector<double> rw_y(locally_owned_dofs);
-
-  for (auto const i : locally_owned_dofs)
-  {
-    rw_x[i] = 1.0 + static_cast<double>(i % 17) / 17.0;
-    rw_y[i] = 0.5 + static_cast<double>(i % 23) / 23.0;
-  }
-
-  x.import_elements(rw_x, dealii::VectorOperation::insert);
-  y.import_elements(rw_y, dealii::VectorOperation::insert);
-
-  // Matrix-vector products
-  _system_matrix.vmult(Ax, x);
-  _system_matrix.vmult(Ay, y);
-
-  // Dot products
-  double const xAy = x * Ay;
-  double const yAx = y * Ax;
-
-  double const scale =
-      std::max(1.0, std::max(std::abs(xAy), std::abs(yAx)));
-
-  double const symmetry_error =
-      std::abs(xAy - yAx) / scale;
-  double const xx = x * x;
-  double const yy = y * y;
-  
-  double const xAx = x * Ax;
-  double const yAy = y * Ay;
-  
-  double const rayleigh_x = xAx / xx;
-  double const rayleigh_y = yAy / yy;
-  
-  // Only print once, not from every MPI rank
-  if (dealii::Utilities::MPI::this_mpi_process(_communicator) == 0)
-  {
-    std::cout << "---- Mechanical matrix symmetry test ----" << std::endl;
-    std::cout << "x^T A y = " << xAy << std::endl;
-    std::cout << "y^T A x = " << yAx << std::endl;
-    std::cout << "relative symmetry error = "
-              << symmetry_error << std::endl;
-    std::cout << "Rayleigh quotient x = "
-              << rayleigh_x << std::endl;
-    std::cout << "Rayleigh quotient y = "
-              << rayleigh_y << std::endl;
-    std::cout << "Reminder: Two positive tests do not prove SPD."  
-              << "They are just inexpensive attempts to falsify it."
-              << "If either quotient is negative, the matrix is not SPD." 
-              << std::endl;
-    std::cout << "-----------------------------------------" << std::endl;
-  }
-  // ---- END DEBUG ----
-  
 #ifdef ADAMANTINE_WITH_CALIPER
   CALI_MARK_END("assemble mechanical matrix");
 #endif
@@ -349,8 +286,6 @@ void MechanicalOperator<dim, n_materials, p_order, MaterialStates,
 #ifdef ADAMANTINE_WITH_CALIPER
   CALI_MARK_BEGIN("initialize mechanical matrix preconditioner");
 #endif
-  // ---- DEBUG: specifying the elastic problem in the preconditioner ----
-  // For mechanics, we have dim displacement components: ux, uy, uz in 3D.
   dealii::FEValuesExtractors::Vector const displacement_components(0);
   auto const component_mask =
       _dof_handler->get_fe_collection().component_mask(
@@ -369,11 +304,9 @@ void MechanicalOperator<dim, n_materials, p_order, MaterialStates,
     std::cout << "AMG elasticity constant modes: "
               << constant_modes.size() << std::endl;
   }
-  // ---- END DEBUG ----
   _preconditioner.clear();
-  // ---- DEBUG: add amg data to preconditioner ----
   _preconditioner.initialize(_system_matrix, amg_data);  
-  // ---- END DEBUG ----
+
 #ifdef ADAMANTINE_WITH_CALIPER
   CALI_MARK_END("initialize mechanical matrix preconditioner");
 #endif

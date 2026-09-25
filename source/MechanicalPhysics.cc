@@ -19,6 +19,10 @@
 #include <caliper/cali.h>
 #endif
 
+//adding for cg residual history logging.
+#include <exception>
+#include <fstream>
+
 namespace adamantine
 {
 template <int dim, int n_materials, int p_order, typename MaterialStates,
@@ -529,11 +533,60 @@ MechanicalPhysics<dim, n_materials, p_order, MaterialStates,
   // TODO check that we are computing only difference of the displacement
   // compared to the previous time step!!
   unsigned int const max_iter = _dof_handler.n_dofs() / 10;
-  double const tol = 1e-12 * _mechanical_operator->rhs().l2_norm();
+  double const rhs_norm = _mechanical_operator->rhs().l2_norm();
+  double const tol = 1e-12 * rhs_norm;
+
   dealii::SolverControl solver_control(max_iter, tol);
+  solver_control.enable_history_data();
   dealii::SolverCG<TrilinosVectorType> cg(solver_control);
-  cg.solve(_mechanical_operator->system_matrix(), displacement, rhs_device,
-           _mechanical_operator->preconditioner());
+  // Give each mechanical solve a unique ID.
+  static unsigned long mechanical_solve_id = 0;
+  unsigned long const this_solve_id = mechanical_solve_id++;
+
+  std::exception_ptr cg_exception;
+  try
+  {
+    cg.solve(_mechanical_operator->system_matrix(), displacement, rhs_device,
+             _mechanical_operator->preconditioner());
+  }
+  catch (...)
+  {
+    // Delay the exception so the failed residual history can still be written.
+    cg_exception = std::current_exception();
+  }
+
+  // Save the CG residual at every iteration.
+  auto const &residual_history = solver_control.get_history_data();
+
+  int const mpi_rank = dealii::Utilities::MPI::this_mpi_process(
+      _mechanical_operator->rhs().get_mpi_communicator());
+
+  if (mpi_rank == 0)
+  {
+    bool const file_exists =
+        static_cast<bool>(std::ifstream("cg_residuals.csv"));
+    std::ofstream out("cg_residuals.csv", std::ios::app);
+    if (!file_exists)
+    {
+      out << "solve_id,n_dofs,iteration,residual,relative_residual\n";
+    }
+    for (unsigned int i = 0; i < residual_history.size(); ++i)
+    {
+      double const residual = residual_history[i];
+
+      out << this_solve_id << ","
+          << _dof_handler.n_dofs() << ","
+          << i << ","
+          << residual << ","
+          << ((rhs_norm > 0.0) ? residual / rhs_norm : 0.0)
+          << "\n";
+    }
+  }
+  // Allow failed CG solve to terminate normally.
+  if (cg_exception)
+  {
+    std::rethrow_exception(cg_exception);
+  }
 
   rw_vector.import_elements(displacement, dealii::VectorOperation::insert);
   dealii::LA::distributed::Vector<double, dealii::MemorySpace::Host>

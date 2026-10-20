@@ -185,8 +185,10 @@ private:
    * quasi-static elasticity solve retain the deformation/stress of a
    * floating solid component without arbitrarily pinning one of its nodes.
    *
-   * The current experimental component finder in MechanicalPhysics.cc is
-   * limited to one MPI rank and a conforming mesh.
+   * The current experimental component finder in MechanicalPhysics.cc
+   * supports MPI on a conforming mechanical mesh. The global component graph
+   * is replicated across ranks during detection; hanging-node constraints are
+   * not yet supported.
    */
   std::vector<
       dealii::LA::distributed::Vector<double, dealii::MemorySpace::Host>>
